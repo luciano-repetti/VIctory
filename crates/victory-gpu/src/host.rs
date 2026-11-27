@@ -5,7 +5,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -17,9 +17,11 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, ResetEvent, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
+
+use crate::object::This;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -139,6 +141,267 @@ pub(crate) fn host() -> Option<&'static Host> {
         }
     })
     .as_ref()
+}
+
+pub(crate) fn late_stage() -> u8 {
+    static STAGE: OnceLock<u8> = OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("VICTORY_LATE_WAIT").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok("3") => 3,
+        Err(_) if crate::switch::on("VICTORY_RELAY") => 3,
+        _ => 0,
+    })
+}
+
+pub(crate) fn late() -> bool {
+    late_stage() > 0
+}
+
+pub(crate) fn late_exact() -> bool {
+    late_stage() > 1
+}
+
+pub(crate) fn late_free_present() -> bool {
+    late_stage() > 2
+}
+
+pub(crate) fn relay() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| late_stage() > 0 && crate::switch::on("VICTORY_RELAY"))
+}
+
+struct Flight {
+    number: u64,
+    fence: u64,
+    lists: Vec<Arc<HostList>>,
+    /// Copy, address, bytes, and whether the range uses title memory. The
+    /// last bit becomes `goes_back` once the checks in `missed` have run
+    /// after the GPU finished.
+    back: Vec<(Arc<crate::shadow::Shadow>, usize, usize, bool)>,
+    /// Ask these only after this submission has run: shaders that read
+    /// title memory with no copy change what may go back.
+    missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    after: Vec<Box<dyn Fn() + Send>>,
+    writes: Vec<(usize, crate::queue::Written, usize)>,
+    written: Vec<(usize, usize)>,
+    keep: Option<Box<dyn std::any::Any + Send>>,
+}
+
+#[cfg(test)]
+impl Flight {
+    fn test(number: u64, writes: Vec<(usize, crate::queue::Written, usize)>) -> Self {
+        let written = writes.iter().map(|&(at, _, bytes)| (at, at + bytes)).collect();
+        Flight {
+            number,
+            fence: number,
+            lists: Vec::new(),
+            back: Vec::new(),
+            missed: Vec::new(),
+            after: Vec::new(),
+            writes,
+            written,
+            keep: None,
+        }
+    }
+}
+
+enum Late {
+    Run(Flight),
+    Write(usize, crate::queue::Written, usize),
+    Signal(usize, u64),
+}
+
+struct Line {
+    line: Vec<Late>,
+    written: Vec<(usize, usize)>,
+    target: u64,
+}
+
+// SAFETY: D3D12 objects and host lists in flights are sent under `LINE`'s lock.
+unsafe impl Send for Line {}
+
+impl Line {
+    const fn new() -> Self {
+        Line {
+            line: Vec::new(),
+            written: Vec::new(),
+            target: 0,
+        }
+    }
+
+    fn add(&mut self, flight: Flight) {
+        let _ = flight.number;
+        self.target = flight.fence;
+        for &(from, to) in &flight.written {
+            join_ranges(&mut self.written, [(from, to)]);
+        }
+        let writes = flight.writes.clone();
+        self.line.push(Late::Run(flight));
+        for (at, what, bytes) in writes {
+            self.line.push(Late::Write(at, what, bytes));
+        }
+    }
+
+    /// Takes only what the waited fence covers. A flight that was added
+    /// after the target was read stays in line, with the ranges its writes
+    /// still guard.
+    fn take_up_to(&mut self, target: u64) -> Vec<Late> {
+        let at = self
+            .line
+            .iter()
+            .position(|item| matches!(item, Late::Run(flight) if flight.fence > target))
+            .unwrap_or(self.line.len());
+        let done = self.line.drain(..at).collect();
+        self.written.clear();
+        for item in &self.line {
+            match item {
+                Late::Run(flight) => join_ranges(&mut self.written, flight.written.iter().copied()),
+                Late::Write(at, _, bytes) => join_ranges(&mut self.written, [(*at, *at + *bytes)]),
+                Late::Signal(..) => {}
+            }
+        }
+        done
+    }
+}
+
+static LINE: Mutex<Line> = Mutex::new(Line::new());
+static LINE_MOVED: Condvar = Condvar::new();
+static LINE_LANDED: Condvar = Condvar::new();
+static RELAY_STARTED: OnceLock<()> = OnceLock::new();
+
+fn line() -> MutexGuard<'static, Line> {
+    LINE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
+    ranges.extend(more.into_iter().filter(|&(from, to)| from < to));
+    ranges.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges.iter().copied() {
+        match joined.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => joined.push((from, to)),
+        }
+    }
+    *ranges = joined;
+}
+
+/// What a deferred list contributes to a flight.
+struct FlightWork {
+    missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    after: Vec<Box<dyn Fn() + Send>>,
+    writes: Vec<(usize, crate::queue::Written, usize)>,
+}
+
+/// Takes the list's work under one lock: taking `after` through
+/// `list.deferred()` again while the guard is held would deadlock the
+/// submitting thread.
+fn take_flight_work(
+    deferred: &Mutex<Deferred>,
+    back: &mut Vec<(Arc<crate::shadow::Shadow>, usize, usize, bool)>,
+    index: &mut std::collections::HashMap<(usize, usize, usize), usize>,
+) -> FlightWork {
+    let mut deferred = deferred.lock().unwrap_or_else(|e| e.into_inner());
+    let missed = std::mem::take(&mut deferred.missed);
+    let after = std::mem::take(&mut deferred.after);
+    let writes = deferred.writes.to_vec();
+    for step in &deferred.copies {
+        if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+            let key = (Arc::as_ptr(shadow) as usize, *address, *len);
+            match index.get(&key) {
+                Some(&i) => back[i].3 &= *memory,
+                None => {
+                    index.insert(key, back.len());
+                    back.push((shadow.clone(), *address, *len, *memory));
+                }
+            }
+        }
+    }
+    FlightWork { missed, after, writes }
+}
+
+fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+    if from >= to {
+        return false;
+    }
+    let at = ranges.partition_point(|r| r.1 <= from);
+    ranges.get(at).is_some_and(|r| r.0 < to)
+}
+
+pub(crate) fn late_blocked(runs: &[&HostList]) -> bool {
+    if !late() {
+        return false;
+    }
+    let written = line().written.clone();
+    runs.iter().any(|list| {
+        list.deferred()
+            .writes
+            .iter()
+            .any(|&(at, _, bytes)| touches(&written, at, at + bytes))
+    })
+}
+
+pub(crate) fn stale_under_flights(runs: &[&HostList]) -> bool {
+    if !late() {
+        return false;
+    }
+    let written = line().written.clone();
+    runs.iter().any(|list| {
+        list.deferred().copies.iter().any(|step| match step {
+            Step::GpuWrite(_, at, bytes, _, _) => touches(&written, *at, *at + *bytes),
+            _ => false,
+        })
+    })
+}
+
+pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+    if !late() {
+        return false;
+    }
+    let mut line = line();
+    if line.line.is_empty() {
+        return false;
+    }
+    line.line.push(Late::Signal(fence, value));
+    drop(line);
+    LINE_MOVED.notify_one();
+    true
+}
+
+pub(crate) fn settle_now() {
+    if !late() {
+        return;
+    }
+    let Some(host) = host() else { return };
+    if relay() {
+        let mut line = line();
+        while !line.line.is_empty() {
+            line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+        }
+        return;
+    }
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle(&mut submitted);
+}
+
+pub(crate) fn settle_for_present() {
+    settle_now();
+}
+
+fn relay_worker() {
+    let Some(host) = host() else { return };
+    loop {
+        {
+            let mut line = line();
+            while line.line.is_empty() {
+                line = LINE_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.settle(&mut submitted);
+        LINE_LANDED.notify_all();
+    }
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -1152,8 +1415,120 @@ impl Host {
         }
     }
 
+    pub(crate) fn settle(&self, submitted: &mut MutexGuard<'_, u64>) {
+        let target = line().target;
+        if target > 0 {
+            // SAFETY: our fence, event and signalled value. The event may
+            // still be signalled by an earlier wait, so clear it first and
+            // trust the fence value, not the wait's return.
+            unsafe {
+                if self.fence.GetCompletedValue() < target {
+                    let _ = ResetEvent(self.event);
+                    if self.fence.SetEventOnCompletion(target, self.event).is_ok() {
+                        WaitForSingleObject(self.event, INFINITE);
+                    }
+                    while self.fence.GetCompletedValue() < target {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+        for item in line().take_up_to(target) {
+            match item {
+                Late::Run(Flight { back, missed: checks, after, lists, keep, .. }) => {
+                    // The checks ask about what the shaders did, so they can
+                    // only be answered now that the GPU has run.
+                    let any_missed = checks.iter().any(|check| check());
+                    let withholding = crate::memory::withholding();
+                    let missed = any_missed || withholding && !checks.is_empty();
+                    crate::memory::note_submission(any_missed);
+                    let mut back = back;
+                    for entry in &mut back {
+                        entry.3 = !(missed && entry.3);
+                    }
+                    let held: Vec<(usize, usize, usize)> = back
+                        .iter()
+                        .filter(|b| !b.3)
+                        .map(|(s, a, n, _)| (Arc::as_ptr(s) as usize, *a, *n))
+                        .collect();
+                    for b in back.iter_mut().filter(|b| b.3) {
+                        let copy = Arc::as_ptr(&b.0) as usize;
+                        b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+                    }
+                    let withheld: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = back
+                        .iter()
+                        .filter(|b| !b.3)
+                        .map(|(s, a, n, _)| (s.clone(), *a, *n))
+                        .collect();
+                    crate::shadow::copy_back_marks(&withheld, withholding);
+                    let read = crate::shadow::take_reads();
+                    if !read.is_empty() {
+                        crate::descriptor::make_read(&read);
+                    }
+                    let relay = relay();
+                    for (shadow, at, bytes, goes_back) in &back {
+                        if *goes_back {
+                            // One pass over a consumed range: a relay merge
+                            // already copied it back.
+                            if relay {
+                                if late_exact() {
+                                    shadow.card_merge_relay(*at, *bytes, *goes_back);
+                                } else {
+                                    shadow.relay_merge(*at, *bytes, *goes_back);
+                                }
+                            } else {
+                                shadow.copy_back(*at, *bytes);
+                            }
+                        } else {
+                            shadow.keep_writes(*at, *bytes);
+                            crate::memory::note_withheld(*bytes as u64);
+                            crate::memory::drop_withheld(*at, *bytes);
+                        }
+                    }
+                    for work in &after {
+                        work();
+                    }
+                    for list in lists {
+                        crate::list::recycle(list);
+                    }
+                    drop(keep);
+                    drop(withheld);
+                }
+                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Signal(fence, value) => {
+                    crate::fence::set(fence as This, value);
+                    crate::fence::let_go(fence as This);
+                }
+            }
+        }
+        let _ = submitted;
+        LINE_LANDED.notify_all();
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        let _ = self.execute_inner(runs, false);
+    }
+
+    /// Sends closed lists without waiting; their writes and signals land in
+    /// [`Host::settle`].
+    pub(crate) fn execute_ahead(&self, lists: Vec<Arc<HostList>>) {
+        let runs: Vec<&HostList> = lists.iter().map(|list| &**list).collect();
+        if let Some(mut flight) = self.execute_inner(&runs, true) {
+            flight.lists = lists;
+            let mut line = line();
+            line.add(flight);
+            drop(line);
+            LINE_MOVED.notify_one();
+            if relay() {
+                RELAY_STARTED.get_or_init(|| {
+                    let _ = std::thread::Builder::new().name("victory-relay".into()).spawn(relay_worker);
+                });
+            }
+        }
+    }
+
+    fn execute_inner(&self, runs: &[&HostList], ahead: bool) -> Option<Flight> {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1215,6 +1590,13 @@ impl Host {
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
+        let send_ahead = ahead && uploads.is_none();
+        if ahead && !send_ahead {
+            // Uploads need the title's memory before it is recorded, so this
+            // submission runs synchronously; earlier flights still have to
+            // land before its lists are reused.
+            self.settle(&mut submitted);
+        }
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1274,15 +1656,21 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                let _ = ResetEvent(self.event);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                if !send_ahead {
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                            while self.fence.GetCompletedValue() < *submitted {
+                                std::thread::yield_now();
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1308,6 +1696,38 @@ impl Host {
                 removed_in = Some(i);
             }
             let _ = (i, started);
+        }
+        if send_ahead {
+            let mut back: Vec<(Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+            let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+            let mut checks: Vec<Box<dyn Fn() -> bool + Send>> = Vec::new();
+            let mut after: Vec<Box<dyn Fn() + Send>> = Vec::new();
+            let mut writes: Vec<(usize, crate::queue::Written, usize)> = Vec::new();
+            for list in runs {
+                let work = take_flight_work(&list.deferred, &mut back, &mut index);
+                checks.extend(work.missed);
+                after.extend(work.after);
+                writes.extend(work.writes);
+            }
+            let mut written = Vec::new();
+            for &(at, _, bytes) in &writes {
+                join_ranges(&mut written, [(at, at + bytes)]);
+            }
+            for &(_, at, bytes, _) in &back {
+                join_ranges(&mut written, [(at, at + bytes)]);
+            }
+            let keep: Box<dyn std::any::Any + Send> = Box::new((batch, back.clone(), heaps));
+            return Some(Flight {
+                number: 0,
+                fence: *submitted,
+                lists: Vec::new(),
+                back: back.clone(),
+                missed: checks,
+                after,
+                writes,
+                written,
+                keep: Some(keep),
+            });
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
@@ -1428,11 +1848,12 @@ impl Host {
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
+        let fence = *submitted;
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
-            let sub = *submitted;
+            let sub = fence;
             drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
@@ -1444,6 +1865,22 @@ impl Host {
             }
             crate::capture::dump_submission(sub, &targets);
         }
+        if ahead {
+            // The submission ran here (uploads are in it), but its lists
+            // still belong to the line until the fence is settled.
+            return Some(Flight {
+                number: 0,
+                fence,
+                lists: Vec::new(),
+                back: Vec::new(),
+                missed: Vec::new(),
+                after: Vec::new(),
+                writes: Vec::new(),
+                written: Vec::new(),
+                keep: None,
+            });
+        }
+        None
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -4129,5 +4566,76 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+}
+
+#[cfg(test)]
+mod flight_tests {
+    use super::*;
+
+    #[test]
+    fn flights_settle_in_submission_order() {
+        let mut line = Line::new();
+        let first = Flight::test(1, vec![(0x10, crate::queue::Written::Value(11), 8)]);
+        line.add(first);
+        line.line.push(Late::Write(0x20, crate::queue::Written::Value(22), 8));
+        line.line.push(Late::Signal(3, 33));
+        let second = Flight::test(2, vec![(0x30, crate::queue::Written::Value(44), 8)]);
+        line.add(second);
+        assert_eq!(line.target, 2);
+        assert!(touches(&line.written, 0x10, 0x18));
+        assert!(touches(&line.written, 0x30, 0x38));
+        let items = line.take_up_to(u64::MAX);
+        let mut seen = Vec::new();
+        for item in items {
+            match item {
+                Late::Run(flight) => seen.push(flight.number),
+                Late::Write(_, crate::queue::Written::Value(value), _) => seen.push(value),
+                Late::Write(..) => seen.push(0),
+                Late::Signal(_, value) => seen.push(value),
+            }
+        }
+        assert_eq!(seen, [1, 11, 22, 33, 2, 44]);
+        assert!(line.written.is_empty());
+    }
+
+    #[test]
+    fn settling_stops_before_a_later_flight() {
+        let mut line = Line::new();
+        line.add(Flight::test(1, vec![(0x10, crate::queue::Written::Value(11), 8)]));
+        line.add(Flight::test(2, vec![(0x20, crate::queue::Written::Value(22), 8)]));
+        line.line.push(Late::Signal(3, 33));
+        let done = line.take_up_to(1);
+        assert_eq!(done.len(), 2, "only the waited flight and its write land");
+        assert!(matches!(&done[0], Late::Run(flight) if flight.number == 1));
+        assert!(matches!(&done[1], Late::Write(0x10, ..)));
+        assert_eq!(line.line.len(), 3, "the later flight, write and signal stay");
+        assert!(!touches(&line.written, 0x10, 0x18));
+        assert!(touches(&line.written, 0x20, 0x28));
+        let rest = line.take_up_to(2);
+        assert_eq!(rest.len(), 3);
+        assert!(matches!(&rest[2], Late::Signal(_, 33)));
+        assert!(line.line.is_empty() && line.written.is_empty());
+    }
+
+    #[test]
+    fn deferred_work_is_taken_without_relocking_the_list() {
+        let deferred = Mutex::new(Deferred::default());
+        {
+            let mut guard = deferred.lock().unwrap();
+            guard.after.push(Box::new(|| {}));
+            guard.missed.push(Box::new(|| true));
+            guard.writes.push((0x10, crate::queue::Written::Value(7), 8));
+        }
+        let mut back = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        let work = take_flight_work(&deferred, &mut back, &mut index);
+        assert_eq!(work.missed.len(), 1);
+        assert!(work.missed[0]());
+        assert_eq!(work.after.len(), 1);
+        assert_eq!(work.writes.len(), 1);
+        assert_eq!((work.writes[0].0, work.writes[0].2), (0x10, 8));
+        let guard = deferred.lock().unwrap();
+        assert!(guard.after.is_empty() && guard.missed.is_empty(), "taken, not copied");
     }
 }

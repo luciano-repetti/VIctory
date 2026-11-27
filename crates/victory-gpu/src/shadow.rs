@@ -405,6 +405,20 @@ impl Shadow {
         self.copy_back_or_not(address, len, false);
     }
 
+    pub(crate) fn relay_merge(&self, address: usize, len: usize, goes_back: bool) -> usize {
+        if !goes_back || !crate::host::relay() {
+            return 0;
+        }
+        self.copy_back(address, len)
+    }
+
+    pub(crate) fn card_merge_relay(&self, address: usize, len: usize, goes_back: bool) -> usize {
+        if !goes_back || !crate::host::relay() || !crate::host::late_exact() {
+            return 0;
+        }
+        self.copy_back(address, len)
+    }
+
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;

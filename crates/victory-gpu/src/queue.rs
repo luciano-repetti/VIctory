@@ -3,7 +3,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -124,11 +127,17 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         for &l in lists {
             for segment in crate::list::segments(l) {
                 let waits = segment.waits();
-                held.push(this as usize, Item::Segment(segment, waits));
+                held.push(this as usize, Held::Segment(segment, waits));
             }
         }
         account().submissions += 1;
-        pump(&mut held, Why::Submission);
+        let async_submit = behind();
+        if async_submit {
+            drop(held);
+            wake();
+        } else {
+            pump(&mut held, Why::Submission);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -150,7 +159,7 @@ pub(crate) enum Why {
 }
 
 #[cfg(windows)]
-use crate::hold::Item;
+use crate::hold::Item as Held;
 
 /// Every queue's held work.
 #[cfg(windows)]
@@ -162,6 +171,159 @@ static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+pub(crate) fn behind() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && crate::host::late();
+        on && worker_started(std::thread::Builder::new().name("victory-submit".into()).spawn(worker))
+    })
+}
+
+#[cfg(windows)]
+fn worker_started(result: std::io::Result<std::thread::JoinHandle<()>>) -> bool {
+    match result {
+        Ok(_) => {
+            tracing::info!("submissions are prepared and sent by the submission worker (VICTORY_ASYNC_SUBMIT=1)");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not start the submission worker; submissions remain synchronous");
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+static WORK: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+#[cfg(windows)]
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+fn wake() {
+    *lock(&WORK.0) = true;
+    WORK.1.notify_one();
+}
+
+#[cfg(windows)]
+fn drain(work: &mut bool, f: impl FnOnce()) -> bool {
+    if !*work {
+        return false;
+    }
+    *work = false;
+    f();
+    true
+}
+
+#[cfg(windows)]
+fn take_work(work: &mut bool) -> bool {
+    std::mem::replace(work, false)
+}
+
+#[cfg(windows)]
+fn worker() {
+    loop {
+        let mut work = lock(&WORK.0);
+        while !*work {
+            work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+        }
+        // Clear the flag before pumping so a wake from the work we run is
+        // kept for the next iteration, and an idle worker waits again.
+        let mut due = take_work(&mut work);
+        drop(work);
+        drain(&mut due, || pump_held(Why::Timer));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn frames_ahead() -> usize {
+    static AHEAD: OnceLock<usize> = OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_FRAMES_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
+
+#[cfg(windows)]
+fn may_send_behind(held: u64, ahead: usize) -> bool {
+    held < ahead as u64
+}
+
+#[cfg(windows)]
+static PRESENTS_HELD: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+fn present_behind() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_PRESENT").is_some_and(|v| v == "1")
+            && behind()
+            && crate::host::late_free_present();
+        if on {
+            tracing::info!(frames_ahead = frames_ahead(), "presents run behind the queue's line (VICTORY_ASYNC_PRESENT=1)");
+        }
+        on
+    })
+}
+
+#[cfg(windows)]
+fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
+    if this.is_null() || planes == 0 || plane_parameters.is_null() || !may_send_behind(PRESENTS_HELD.load(Ordering::Relaxed), frames_ahead()) {
+        return false;
+    }
+    let frame = FRAMES.load(Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::wanted(frame) || crate::capture::listed(frame) {
+        return false;
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+    let mut sources = Vec::new();
+    let mut states = Vec::new();
+    for plane in slice {
+        if plane.count == 0 || plane.resources.is_null() {
+            continue;
+        }
+        // SAFETY: the plane lists `count` resources.
+        let resource = unsafe { *plane.resources };
+        let Some(texture) = crate::resource::host_resource(resource) else { continue };
+        const COPY_SOURCE: u32 = 0x800;
+        let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+        crate::resource::host_transition(resource, state);
+        sources.push((resource as usize, texture, state));
+        states.push(state);
+    }
+    if sources.is_empty() {
+        return false;
+    }
+    let _ = states;
+    held().push(this as usize, Held::Present(sources, frame));
+    PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
+    wake();
+    true
+}
+
+#[cfg(windows)]
+fn show_present(sources: Vec<(usize, ID3D12Resource, u32)>, frame: u64) {
+    if let Some(host) = crate::host::host() {
+        let refs: Vec<(&ID3D12Resource, u32)> = sources.iter().map(|(_, texture, state)| (texture, *state)).collect();
+        let _ = host.present(&refs, frame);
+        for &(resource, _, state) in &sources {
+            crate::resource::host_transition(resource as This, state);
+        }
+    }
+    PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
+    FRAMES.store(frame, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::frame::presented();
 }
 
 /// Runs held work that may run now (`why` for the frame line).
@@ -204,23 +366,34 @@ fn pump(held: &mut Holding, why: Why) {
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
+    let mut run = |_: usize, segments: Vec<Arc<crate::host::HostList>>| {
         let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+        if crate::host::late_blocked(&lists) || crate::host::stale_under_flights(&lists) {
+            crate::host::settle_now();
+        }
         let at = std::time::Instant::now();
-        host.execute(&lists);
+        if crate::host::late() {
+            host.execute_ahead(segments);
+        } else {
+            host.execute(&lists);
+            drop(lists);
+            segments.into_iter().for_each(crate::list::recycle);
+        }
         ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
+        if !crate::host::late_signal(f, value) {
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        }
     };
+    let mut present = show_present;
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
         run: &mut run,
         signal: &mut signal,
+        present: &mut present,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
@@ -248,7 +421,7 @@ fn pump(held: &mut Holding, why: Why) {
 
 /// The value a wait tests (4 or 8 bytes), if the memory can be read.
 #[cfg(windows)]
-fn read_value(address: u64, bytes: u8) -> Option<u64> {
+pub(crate) fn read_value(address: u64, bytes: u8) -> Option<u64> {
     let mut value = [0u8; 8];
     crate::host::read_into(address as *const u8, &mut value[..usize::from(bytes.min(8))]).then(|| u64::from_le_bytes(value))
 }
@@ -372,6 +545,17 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+/// Signals now, or leaves a `Late::Signal` for the host's line. The fence
+/// is kept from the moment it is pushed until [`crate::host::Host::settle`]
+/// lets it go; a signal that lands now balances the keep here.
+fn signal_deferred(fence: This, value: u64, defer: impl FnOnce(usize, u64) -> bool) {
+    crate::fence::keep(fence);
+    if !defer(fence as usize, value) {
+        crate::fence::set(fence, value);
+        crate::fence::let_go(fence);
+    }
+}
+
 /// At once, or behind the work the queue holds (its fence, and the memory
 /// the title reads it at, move only once that work has run).
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
@@ -383,9 +567,9 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         let mut held = held();
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
-            held.push(this as usize, Item::Signal(fence as usize, value));
+            held.push(this as usize, Held::Signal(fence as usize, value));
         } else {
-            crate::fence::set(fence, value);
+            signal_deferred(fence, value, crate::host::late_signal);
         }
         // Another queue may wait for this fence.
         pump(&mut held, Why::Signal);
@@ -408,7 +592,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
         let mut held = held();
-        held.push(this as usize, Item::FenceWait(fence as usize, value));
+        held.push(this as usize, Held::FenceWait(fence as usize, value));
         pump(&mut held, Why::Wait);
     }
     #[cfg(not(windows))]
@@ -481,20 +665,35 @@ pub(crate) fn presented() -> u64 {
 
 /// Shows the first resource of each presented plane in our window.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
-    // What may run before the frame is shown does.
-    // shortcut: PresentX does not wait behind work the queue still holds (it
-    // shows the frame as far as it ran); the frame line names such work.
-    pump_held(Why::Present);
-    let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
-    account_frame(frame);
+    let sent = present_behind() && send_behind(this, planes, plane_parameters);
+    #[cfg(not(windows))]
+    let sent = false;
+    if !sent {
+        if crate::host::late() && !crate::host::late_free_present() {
+            crate::host::settle_for_present();
+        }
+        pump_held(Why::Present);
+    }
+    let frame = if sent {
+        FRAMES.load(Ordering::Relaxed) + 1
+    } else {
+        FRAMES.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    #[cfg(windows)]
+    if !sent {
+        account_frame(frame);
+    }
     #[cfg(feature = "diagnostics")]
-    crate::frame::presented();
+    if !sent {
+        // A held present counts in `show_present`, where it actually runs.
+        crate::frame::presented();
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -531,7 +730,8 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    if planes > 0
+    if !sent
+        && planes > 0
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
@@ -540,7 +740,8 @@ extern "system" fn present(
 
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
-        let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+    // SAFETY: the title passes `planes` plane descriptions.
+    let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
             Vec::with_capacity(slice.len());
         for plane in slice {
@@ -909,5 +1110,89 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn async_submit_worker_drains_pending_work() {
+        let mut work = true;
+        let mut drained = 0;
+        assert!(drain(&mut work, || drained += 1));
+        assert_eq!(drained, 1);
+        assert!(!work);
+        assert!(!drain(&mut work, || drained += 1));
+        assert_eq!(drained, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn frames_ahead_bounds_held_presents() {
+        assert!(!may_send_behind(1, 1));
+        assert!(may_send_behind(0, 1));
+        assert!(may_send_behind(1, 2));
+        assert!(!may_send_behind(2, 2));
+        assert_eq!(frames_ahead(), frames_ahead().max(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_worker_creation_keeps_synchronous_submission() {
+        assert!(!worker_started(Err(std::io::Error::other("no worker"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn async_submit_worker_clears_its_flag_when_idle() {
+        let mut work = true;
+        let mut due = take_work(&mut work);
+        assert!(due, "a wake is taken once");
+        assert!(!work, "no stale flag left to spin on");
+        assert!(drain(&mut due, || {}), "the taken wake is drained");
+        assert!(!due && !work, "idle after draining");
+    }
+
+    #[test]
+    fn late_signal_keeps_the_fence_until_settled() {
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                1,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence,
+            ),
+            S_OK
+        );
+        let before = crate::object::refs(fence as This);
+        let mut deferred = false;
+        signal_deferred(fence as This, 7, |_, value| {
+            deferred = value == 7;
+            true
+        });
+        assert!(deferred);
+        assert_eq!(crate::object::refs(fence as This), before + 1, "held by the line");
+        assert_eq!(crate::fence::value(fence as This), 1, "not signalled early");
+        // What `Host::settle` does with the `Late::Signal`.
+        crate::fence::set(fence as This, 7);
+        crate::fence::let_go(fence as This);
+        assert_eq!(crate::object::refs(fence as This), before);
+        assert_eq!(crate::fence::value(fence as This), 7);
+
+        let mut immediate = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut immediate,
+            ),
+            S_OK
+        );
+        let before = crate::object::refs(immediate as This);
+        signal_deferred(immediate as This, 9, |_, _| false);
+        assert_eq!(crate::object::refs(immediate as This), before, "keep released");
+        assert_eq!(crate::fence::value(immediate as This), 9);
     }
 }

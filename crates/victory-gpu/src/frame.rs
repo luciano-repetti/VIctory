@@ -137,7 +137,13 @@ pub(crate) extern "system" fn wait(
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // The tick is only logged (diagnostics); taking it is what counts.
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (tick, wait) = next_tick(kind, limit);
+    let (tick, mut wait) = next_tick(kind, limit);
+    let late_wait = |name| {
+        std::env::var_os(name).is_some_and(|v| matches!(v.to_str(), Some("1" | "2" | "3")))
+    };
+    if !origin && (late_wait("VICTORY_LATE_WAIT") || late_wait("VICTORY_LATE_WAITS")) {
+        wait = Duration::ZERO;
+    }
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT

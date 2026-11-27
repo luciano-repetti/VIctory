@@ -17,6 +17,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
 /// A wait for a memory value, as a list records it: the value at `address`
 /// (`bytes` 4 or 8, the 32-bit form masked) compared with `reference` by a
 /// D3D12 comparison function.
@@ -70,6 +73,8 @@ pub(crate) enum Item<S> {
     Signal(usize, u64),
     /// A fence Wait: until the fence reaches the value.
     FenceWait(usize, u64),
+    #[cfg(windows)]
+    Present(Vec<(usize, ID3D12Resource, u32)>, u64),
 }
 
 /// What a pump did, for the frame's accounting.
@@ -117,6 +122,8 @@ pub(crate) struct World<'a, S> {
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    #[cfg(windows)]
+    pub(crate) present: &'a mut dyn FnMut(Vec<(usize, ID3D12Resource, u32)>, u64),
 }
 
 impl<S> Held<S> {
@@ -165,6 +172,14 @@ impl<S> Held<S> {
                             }
                             true
                         }
+                        #[cfg(windows)]
+                        Some((Item::Present(..), ..)) => {
+                            if !piece.is_empty() {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
+                            true
+                        }
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
                             let ok = (w.fence)(*fence) >= *value;
                             if !ok {
@@ -183,6 +198,8 @@ impl<S> Held<S> {
                             done.segments += 1;
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
+                        #[cfg(windows)]
+                        Some(Item::Present(sources, frame)) => (w.present)(sources, frame),
                         Some(Item::FenceWait(..)) | None => {}
                     }
                 }
@@ -280,7 +297,7 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, present: &mut |_, _| {} })
     }
 
     #[test]
