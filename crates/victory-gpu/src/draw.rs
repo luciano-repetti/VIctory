@@ -1059,9 +1059,33 @@ impl State {
         };
         self.dynamic
             .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        let Some((at, resource)) = visible.make_clear_at(slot, &view) else {
+        let Some((at, resource, within)) = visible.make_clear_at(slot, &view) else {
             once!("an unordered access clear of a view the host cannot make");
             return;
+        };
+        // The host view starts before the title's: clear its part of it.
+        let shifted: Vec<RECT>;
+        let rects = match within {
+            None => rects,
+            Some((first, end)) => {
+                shifted = if rects.is_empty() {
+                    vec![RECT { left: first, top: 0, right: end, bottom: 1 }]
+                } else {
+                    rects
+                        .iter()
+                        .map(|r| RECT {
+                            left: r.left.saturating_add(first),
+                            right: r.right.saturating_add(first).min(end),
+                            ..*r
+                        })
+                        .filter(|r| r.left < r.right)
+                        .collect()
+                };
+                if shifted.is_empty() {
+                    return;
+                }
+                &shifted
+            }
         };
         let written = UsedResource {
             kind: ResourceType::Uav,

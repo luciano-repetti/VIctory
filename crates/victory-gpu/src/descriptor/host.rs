@@ -420,17 +420,35 @@ impl HostHeap {
         self.note_address(index, Some(view));
     }
 
-    /// Matching CPU and shader-visible UAVs for a native clear. These slots
-    /// are private to the clear, so a structured buffer can use an exact
-    /// one-dword typed view without changing the slots translated shaders use.
+    /// Matching CPU and shader-visible UAVs for a native clear, and the
+    /// element range of the view to clear: `None` for all of it, else the
+    /// view starts `skip` words (0..3) before the title's and `words` of
+    /// them are the title's.
+    ///
+    /// A structured buffer is viewed raw from the 16-byte boundary at or
+    /// before its start, as [`buffer_uav`] does for shaders, and a native
+    /// clear has no shader to skip that bias: the caller clears only
+    /// `skip..skip + words`. Making the view start on the title's own word
+    /// instead is not an option: Intel's driver clears a typed buffer view
+    /// from `FirstElement` rounded down to a multiple of the largest of 1, 2
+    /// and 4 that divides `NumElements`, so an unaligned start moves the
+    /// whole range down (measured on Arc Xe-LPG, driver 32.0.101.6127).
+    /// Clears of a strict part of the view, which this always is when
+    /// `skip` is not zero, take no such shortcut.
     pub(crate) fn make_clear_at(
         &self,
         index: u32,
         view: &View,
-    ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+    ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource, Option<(i32, i32)>)> {
         let host = host()?;
         let at = host.cpu_view();
-        let kept = make(view, at, true)??;
+        RAW_BIAS.with(|b| b.set(0));
+        let kept = make(view, at)??;
+        let skip = RAW_BIAS.with(std::cell::Cell::take) / 4;
+        let range = (skip != 0).then(|| {
+            let words = buffer_range(view).map_or(0, |(_, bytes)| bytes / 4);
+            (skip as i32, (u64::from(skip) + words).min(i32::MAX as u64) as i32)
+        });
         // SAFETY: the source is CPU-only, and the destination is this list's dynamic slot.
         unsafe {
             host.device.CopyDescriptorsSimple(
@@ -442,7 +460,7 @@ impl HostHeap {
         }
         let resource = kept.0.clone();
         self.keep(index, Some(kept));
-        Some((at, resource))
+        Some((at, resource, range))
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -1383,7 +1401,6 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    for_clear: bool,
 ) -> Option<Kept> {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1421,26 +1438,20 @@ fn buffer_uav(
             once!(offset, element, "refused structured UAV: host offset not 4-byte aligned");
             return None;
         }
-        // Translated shaders skip the rounded prefix using VIEW_STRIDES.
-        // Native clears have no shader to add the bias. A typed dword UAV
-        // can start at the actual word and keep the original logical length.
+        // Translated shaders skip the rounded prefix using VIEW_STRIDES; a
+        // native clear skips it with a rectangle ([`HostHeap::make_clear_at`]).
         let bias = offset & (RAW_VIEW_ALIGN - 1);
-        let (format, flags, bias) = if for_clear && bias != 0 {
-            (DXGI_FORMAT_R32_UINT, D3D12_BUFFER_UAV_FLAG_NONE, 0)
-        } else {
-            (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_UAV_FLAG_RAW, bias)
-        };
         let aligned = offset - bias;
         let raw_dwords = total_bytes.checked_add(bias)? / 4;
         let Ok(raw_count) = u32::try_from(raw_dwords) else {
             once!(raw_dwords, element, "refused structured UAV: exceeds u32 raw elements");
             return None;
         };
-        desc.Format = format;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
         buffer.FirstElement = aligned / 4;
         buffer.NumElements = raw_count;
         buffer.StructureByteStride = 0;
-        buffer.Flags = flags;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         (4, buffer.FirstElement, buffer.NumElements, bias as u32)
     } else {
         buffer.FirstElement = offset / element;
@@ -1480,7 +1491,7 @@ fn make_marked(
 ) -> (Option<Kept>, Option<(u32, u32)>, u32) {
     MARK.with(|m| m.set(None));
     RAW_BIAS.with(|b| b.set(0));
-    let kept = make(view, at, false);
+    let kept = make(view, at);
     (
         kept,
         MARK.with(std::cell::Cell::take),
@@ -1613,12 +1624,12 @@ fn typed_store(format: u32) -> bool {
 /// the host resource it views, if it can.
 #[cfg(test)]
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at, false).flatten().map(|k| k.0)
+    make(view, at).flatten().map(|k| k.0)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option<Kept> {
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1684,7 +1695,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option
             let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at, for_clear)
+                        buffer_uav(data as u64, len, uav_desc(desc), at)
                     }
                     _ => None,
                 };
@@ -1740,7 +1751,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at, for_clear);
+                return make(&view, at);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1751,7 +1762,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at, for_clear)
+                buffer_uav(address, len, uav_desc(words), at)
             } else {
                 buffer_srv(address, len, srv_desc(words), at)
             }
