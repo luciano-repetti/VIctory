@@ -540,9 +540,11 @@ fn adapters() -> Vec<Adapter> {
                 eprintln!("skipping software adapter {name}");
                 continue;
             }
-            // DXGI can list one adapter more than once.
-            let luid = (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
-            if !seen.insert(luid) {
+            // DXGI can list one adapter more than once, under different LUIDs
+            // on hybrid laptops (seen with an Arc iGPU next to an RTX), so
+            // compare the hardware. Two identical cards are measured once.
+            let part = (desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision);
+            if !seen.insert(part) {
                 continue;
             }
             let mut device: Option<ID3D12Device> = None;
