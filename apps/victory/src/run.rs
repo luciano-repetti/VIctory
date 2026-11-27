@@ -228,6 +228,7 @@ fn check_startup_archive(path: &Path) -> Result<()> {
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
+    patch(image.base(), image.info().size_of_image as usize);
     watch(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
@@ -247,6 +248,28 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+}
+
+/// `VICTORY_PATCH=<rva>:<hex bytes>,...` writes those bytes at title+rva
+/// once, before the title runs, read-only data included (Grand Theft Auto
+/// VI: its display mode table's 4K entry at 0x615c100 made 1920x1080,
+/// `80070000 38040000`, renders the Series X mode at 1080p).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn patch(base: usize, size: usize) {
+    let Ok(value) = std::env::var("VICTORY_PATCH") else {
+        return;
+    };
+    match victory_loader::parse_patches(&value) {
+        Ok(patches) => {
+            for (rva, bytes) in patches {
+                match victory_loader::patch_image(base, size, rva, &bytes) {
+                    Ok(()) => tracing::info!(rva = format_args!("{rva:#x}"), bytes = bytes.len(), "title patched"),
+                    Err(e) => tracing::warn!(error = %e, "VICTORY_PATCH not applied"),
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "VICTORY_PATCH not understood"),
+    }
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each

@@ -379,6 +379,13 @@ impl RtvRecord {
             ]
         };
         words[0] = crate::resource::pc_format(words[0]);
+        // A view of a texture whose host copy stands in for the view's
+        // format takes the copy's (`resource::target_format`).
+        if let Some(host) = crate::resource::host_resource(self.resource) {
+            // SAFETY: a live resource.
+            let format = unsafe { host.GetDesc() }.Format.0 as u32;
+            words[0] = crate::resource::view_on(words[0], format);
+        }
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

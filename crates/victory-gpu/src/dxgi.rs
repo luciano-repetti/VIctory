@@ -250,15 +250,40 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
+    // `VICTORY_DISPLAY_MODE=WIDTHxHEIGHT` advertises that mode. It does not
+    // force the title to use it for its render targets.
+    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let &(width, height) = SIZE.get_or_init(|| {
+        std::env::var("VICTORY_DISPLAY_MODE")
+            .ok()
+            .and_then(|v| {
+                let (w, h) = v.trim().to_ascii_lowercase().split_once('x').map(|(w, h)| (w.trim().to_owned(), h.trim().to_owned()))?;
+                Some((w.parse().ok()?, h.parse().ok()?))
+            })
+            .filter(|&(w, h): &(u32, u32)| w > 0 && h > 0)
+            .unwrap_or((3840, 2160))
+    });
+    static QUERY_LOGGED: std::sync::Once = std::sync::Once::new();
+    QUERY_LOGGED.call_once(|| {
+        tracing::info!(
+            format = _format,
+            flags = _flags,
+            "title queried the display mode list"
+        );
+    });
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
         scaling: 0,
         flags: 0,
     };
+    static MODE_LOGGED: std::sync::Once = std::sync::Once::new();
+    MODE_LOGGED.call_once(|| {
+        tracing::info!(width, height, "advertised display mode");
+    });
     // SAFETY: checked non-null; room for `count` >= 1 modes.
     unsafe { out.write(mode) };
     S_OK

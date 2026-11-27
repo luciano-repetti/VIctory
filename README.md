@@ -131,6 +131,11 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+`VICTORY_DISPLAY_MODE=1280x720` advertises that display mode to the title. It
+does not force the title to render at 720p; check the `advertised display mode`
+and `presenting to a window` diagnostics to see which mode was offered and
+which size the title actually rendered.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 

@@ -88,6 +88,51 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The slots at the top of a capped view heap kept for the null buffer
+/// views (`null_buffer_view() - 1` and `null_buffer_view()`) and the last
+/// slot, past every title and dynamic slot.
+const NULL_ROOM: u32 = 3;
+
+/// The largest shader-visible view heap the host takes, at most
+/// `HEAP_VIEWS_MAX`: that size if it takes it, else the largest multiple
+/// of 2^16 it does (searched down to `PORTABLE_VIEWS`, which every host
+/// takes).
+pub(crate) fn probe_heap_views(device: &ID3D12Device) -> u32 {
+    let takes = |n: u32| {
+        // SAFETY: plain heap creation, released at once.
+        unsafe {
+            device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: n,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .is_ok()
+        }
+    };
+    let max = victory_shader::emit::HEAP_VIEWS_MAX;
+    if takes(max) {
+        return max;
+    }
+    // Largest multiple of 2^16 in [PORTABLE_VIEWS, max) the host takes.
+    const STEP: u32 = 1 << 16;
+    let (mut lo, mut hi) = (PORTABLE_VIEWS.div_ceil(STEP), max / STEP);
+    if !takes(lo * STEP) {
+        return PORTABLE_VIEWS;
+    }
+    // Invariant: `lo` steps taken, `hi` steps refused.
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if takes(mid * STEP) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo * STEP
+}
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -121,14 +166,15 @@ impl HostHeap {
         };
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        // which has no bounds, at indices clamped below `heap_views()`.
+        let slots = u64::from(count.max(victory_shader::emit::heap_views()));
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(slots * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
             .then(|| {
-                let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
+                let bytes = slots * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 crate::host::name(&buffer, || "view marks".into());
                 // Every slot unmarked (all ones) until a view is made there.
@@ -139,9 +185,10 @@ impl HostHeap {
             .flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
+        // Translated shaders clamp their indices below `heap_views()` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        let views = victory_shader::emit::heap_views();
+        let samplers = victory_shader::emit::HEAP_SAMPLERS;
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -150,21 +197,37 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
+        } else if let Ok(heap) = make((count + DYNAMIC + NULL_ROOM).max(views)) {
             (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            // A host that caps its heaps (`views` is its largest,
+            // `probe_heap_views`): exactly that many slots, the null buffer
+            // views in the last ones, the fewer dynamic slots below them and
+            // the title's below those. Shaders clamp below `views`, so no
+            // index leaves the heap.
+            // shortcut: title slots past the room left are left out (read
+            // null); a title that reaches them needs remapping.
+            // The dynamic slots keep their full count where the heap has
+            // room for it: with `MIN_DYNAMIC`, Grand Theft Auto VI's world
+            // ran out of them on the RTX 5060's 1,000,000-slot heap (draws
+            // dropped, then the title waited for their work for good),
+            // where fewer title slots only leave more of its views null.
+            let dynamic = if views > 2 * DYNAMIC { DYNAMIC } else { MIN_DYNAMIC };
+            let room = views.saturating_sub(dynamic + NULL_ROOM);
+            match make(views) {
+                Ok(heap) => {
+                    if count > room {
+                        tracing::warn!(
+                            count,
+                            room,
+                            views,
+                            "host view heap capped: title slots past the room left read null"
+                        );
+                    }
+                    (heap, count.min(room), dynamic)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    tracing::warn!(error = %e, count, views, sampler, "no host descriptor heap");
                     return None;
                 }
             }
@@ -198,7 +261,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
+            pairs_end: match victory_shader::emit::null_buffer_view() {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
             },
@@ -222,7 +285,7 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        let null = victory_shader::emit::null_buffer_view();
         if !sampler && null > count + extra && null < total {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
@@ -500,11 +563,11 @@ impl HostHeap {
 
     fn write_stride(&self, index: u32, stride: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= self.count.max(victory_shader::emit::heap_views()) {
             return;
         }
         // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
+        // the larger of the title's count and `heap_views()`.
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 
@@ -518,12 +581,12 @@ impl HostHeap {
     /// none for anything else.
     pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
         let Some((_, data)) = &self.marks else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= self.count.max(victory_shader::emit::heap_views()) {
             return;
         }
         let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
         // SAFETY: two dwords of the mapped table, which has two per slot
-        // below the larger of the title's count and `HEAP_VIEWS`.
+        // below the larger of the title's count and `heap_views()`.
         unsafe {
             let at = (*data as *mut u32).add(2 * index as usize);
             at.write_volatile(entry.0);
@@ -1354,6 +1417,16 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
     };
     let own = d.Format.0 as u32;
+    // A view in a format the host texture stands in for takes the
+    // texture's (`resource::target_format`), unless the texture was made
+    // castable to it: then the view reads the bits in the title's format
+    // (R9G9B9E5 of an R11G11B10 texture GPU-written as R32_UINT: read as
+    // R11G11B10, Grand Theft Auto VI's lighting got garbage).
+    if let Some(f) = format.as_deref_mut()
+        && !castable.contains(&(f.0 as u32))
+    {
+        f.0 = crate::resource::view_on(f.0 as u32, own) as i32;
+    }
     if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
         once!(
             unordered,
@@ -1504,6 +1577,25 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     && let Some(format) = crate::resource::view_format(resource)
                 {
                     desc.Format = DXGI_FORMAT(format as i32);
+                }
+                // Views in a format of another family than the texture's
+                // (logged once per pair): the host makes them only where the
+                // texture was made castable to it (`fits`).
+                #[cfg(feature = "diagnostics")]
+                if let Some(d) = desc.as_ref() {
+                    // SAFETY: a live resource.
+                    let td = unsafe { texture.GetDesc() };
+                    let (own, view) = (td.Format.0 as u32, d.Format.0 as u32);
+                    if view != own && crate::resource::family(view) != crate::resource::family(own) {
+                        static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+                        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                        if !seen.contains(&(view, own)) && seen.len() < 64 {
+                            seen.push((view, own));
+                            tracing::warn!(view, own, width = td.Width, height = td.Height, castable = ?copy.castable,
+                                stand_in = crate::resource::view_on(view, own) == own,
+                                "a shader view in a format of another family than its host texture");
+                        }
+                    }
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -2220,10 +2312,10 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `heap_views()`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::heap_views());
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }

@@ -190,7 +190,14 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let made = match high_performance_adapter() {
+                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device),
+                None => Err(windows::core::Error::empty()),
+            };
+            if made.is_err() || device.is_none() {
+                device = None;
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -204,6 +211,30 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
+        // Whether compute shaders run in 64-lane waves: the translation
+        // splits wave64 programs into host waves of 32 lanes otherwise.
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let wave64 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+            && options.WaveLaneCountMin <= 64
+            && options.WaveLaneCountMax >= 64;
+        victory_shader::emit::set_host_wave64(wave64);
+        // `VICTORY_WAVE64_APPROX=1`: wave64 programs the split refuses run
+        // anyway in 32-lane waves, possibly drawing wrong, instead of not.
+        let approx = !wave64 && crate::switch::on("VICTORY_WAVE64_APPROX");
+        victory_shader::emit::set_wave64_approx(approx);
+        tracing::info!(
+            min = options.WaveLaneCountMin,
+            max = options.WaveLaneCountMax,
+            wave64,
+            approx,
+            "host wave lanes"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -236,6 +267,19 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        // Translated shaders clamp view heap indices below the largest heap
+        // this host takes, so none leaves the heap (a device removal on
+        // hosts that cap their heaps below `HEAP_VIEWS_MAX`).
+        let views = crate::descriptor::host::probe_heap_views(&device);
+        if views < victory_shader::emit::HEAP_VIEWS_MAX {
+            tracing::info!(views, "host view heaps capped: shaders index below this");
+        }
+        if !victory_shader::emit::set_heap_views(views) {
+            tracing::warn!(
+                views,
+                "view heap size found after shaders were translated: they may index past the heap"
+            );
+        }
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -285,6 +329,28 @@ fn process_memory() -> (u64, u64) {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
+/// The fastest hardware adapter (the discrete GPU of a laptop with two,
+/// which DXGI's default order leaves second); `None` to take the default.
+fn high_performance_adapter() -> Option<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        for index in 0.. {
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByGpuPreference(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+                .ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                let name = String::from_utf16_lossy(&desc.Description);
+                let name = name.trim_end_matches('\0');
+                tracing::info!(adapter = name, "host adapter (high performance)");
+                return Some(adapter);
+            }
+        }
+        None
+    }
+}
+
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
@@ -438,7 +504,7 @@ pub(crate) mod tests {
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
+        let (plain, memory) = (victory_shader::emit::HEAP_VIEWS_MAX - 2, victory_shader::emit::HEAP_VIEWS_MAX - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
         let taken = crate::shadow::take_reads();

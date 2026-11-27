@@ -778,8 +778,13 @@ impl State {
                             match offset {
                                 Some(offset) => offset,
                                 None => {
-                                    not_run("a root view's offset: no root view, or outside title buffers");
-                                    return false;
+                                    // No root view, or one outside title buffers:
+                                    // its view is the null buffer view (below,
+                                    // `root_view`), read at 0. A console shader
+                                    // need not touch a root view on every path.
+                                    let root = self.roots_ref(compute).get(usize::from(u.slot)).cloned();
+                                    once!(slot = u.slot, root = ?root, "a root view's offset: no root view, or outside title buffers; read as the null view");
+                                    0
                                 }
                             }
                         }
@@ -921,13 +926,13 @@ impl State {
     /// memory for 1 MiB from its address, as before the views.
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            once!(slot, "a shader reads a root view the title did not set: dropped");
-            not_run("a root view the title did not set");
-            return None;
+            // The null buffer view: reads give zeros, writes go nowhere.
+            once!(slot, "a shader reads a root view the title did not set: the null view");
+            return Some((victory_shader::emit::null_buffer_view(), 0));
         };
         let Some(shadow) = crate::shadow::find(address, 1) else {
-            not_run("a root view outside title buffers");
-            return None;
+            once!(slot, address = format_args!("{address:#x}"), "a root view outside title buffers: the null view");
+            return Some((victory_shader::emit::null_buffer_view(), 0));
         };
         let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
             not_run("a root view 4 GiB or more into its copy");
@@ -2029,6 +2034,8 @@ const QUAD_STRIP: u32 = 20;
 mod tests {
     use super::*;
 
+    mod packed_lighting;
+
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
     /// that binds none, which a compute list that only reads views does.
@@ -2761,11 +2768,11 @@ uint ps() : SV_Target { return 1; }
             Slots(heap, step)
         }
 
-        fn make(&self, i: u32, view: &View) {
+        fn make(&self, i: u32, view: &View) -> ID3D12Resource {
             // SAFETY: a live heap.
             let mut at = unsafe { self.0.GetCPUDescriptorHandleForHeapStart() };
             at.ptr += (i * self.1) as usize;
-            assert!(crate::descriptor::host::make_view(view, at).is_some(), "slot {i} made");
+            crate::descriptor::host::make_view(view, at).expect("host resource for the view")
         }
 
         fn gpu(&self, i: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {

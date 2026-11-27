@@ -75,9 +75,8 @@ unsafe impl Send for SharedDevice {}
 unsafe impl Sync for SharedDevice {}
 
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
-    // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    // SAFETY: plain DXGI calls with valid out pointers.
     unsafe {
-        let mut device: Option<ID3D12Device> = None;
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
         let adapter: IDXGIAdapter1 = if warp {
@@ -85,7 +84,16 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
         } else {
             hardware_adapter(&factory).map_err(err)?
         };
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        device_on(&adapter)
+    }
+}
+
+/// A device on `adapter` that runs SM 6.6.
+fn device_on(adapter: &IDXGIAdapter1) -> Result<ID3D12Device, String> {
+    // SAFETY: plain D3D12 calls with valid out pointers.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
         let device = device.ok_or("no device")?;
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -137,8 +145,18 @@ fn on_software_adapter(device: &ID3D12Device) -> bool {
 fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
     // SAFETY: plain DXGI adapter enumeration.
     unsafe {
+        // The fastest first (a laptop's discrete GPU, which the default
+        // order leaves second); the default order without IDXGIFactory6.
+        let preferred = factory.cast::<IDXGIFactory6>().ok();
         for index in 0.. {
-            let Ok(adapter) = factory.EnumAdapters1(index) else {
+            let adapter = match &preferred {
+                Some(f) => f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                    index,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                ),
+                None => factory.EnumAdapters1(index),
+            };
+            let Ok(adapter) = adapter else {
                 break;
             };
             let desc = adapter.GetDesc1()?;
@@ -194,6 +212,38 @@ impl Host {
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
         Host { device, warp }
+    }
+
+    /// Every hardware adapter that runs SM 6.6, by name: GPUs as
+    /// [`hardware_adapter`] takes them (not software, with video memory of
+    /// their own).
+    pub fn hardware() -> Vec<(String, Host)> {
+        let mut out = Vec::new();
+        // SAFETY: plain DXGI calls with valid out pointers.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return out;
+            };
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || desc.DedicatedVideoMemory == 0
+                {
+                    continue;
+                }
+                let len = desc.Description.iter().position(|&c| c == 0);
+                let name = String::from_utf16_lossy(&desc.Description[..len.unwrap_or(128)]);
+                if let Ok(device) = device_on(&adapter) {
+                    out.push((name, Host { device, warp: false }));
+                }
+            }
+        }
+        out
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -593,6 +643,23 @@ impl Host {
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
+    }
+
+    /// The wave sizes this device runs, fewest and most lanes
+    /// (`D3D12_FEATURE_D3D12_OPTIONS1`); a program declaring a wave size
+    /// outside them is refused.
+    pub fn wave_lanes(&self) -> Result<(u32, u32), String> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok((o.WaveLaneCountMin, o.WaveLaneCountMax))
     }
 
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
@@ -1335,8 +1402,8 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
+    /// Last in the heap, which then has [`super::heap_views`] slots: the
+    /// host's null raw buffer SRV at [`super::null_buffer_view`] and UAV
     /// below it.
     NullBuffers,
 }
@@ -1542,7 +1609,7 @@ impl Host {
                 Ok::<_, String>(zeros)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::heap_views() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1878,7 +1945,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

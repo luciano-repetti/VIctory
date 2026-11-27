@@ -126,23 +126,33 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
     })
 }
 
-fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+pub(super) fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+    lowered_for(native, super::host_wave64())
+}
+
+pub(super) fn lowered_for(
+    native: &NativeProgram,
+    host_wave64: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
-    lower::lower(&lower::Parts {
-        native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: false,
-    })
+    lower::lower_for(
+        &lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+        },
+        host_wave64,
+    )
 }
 
 /// The first texel of a footprint (see `Lower::gather_first`).

@@ -663,10 +663,14 @@ impl Prebuild {
         library::keep_early_list();
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
-        let quiet = tracing::Dispatch::none();
-        let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
-        });
+        // `VICTORY_PREBUILD_VERBOSE` keeps them (why a pipeline is refused;
+        // with `VICTORY_D3D12_DEBUG`, the debug layer's reason).
+        let make = || host::HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        let made = if crate::switch::on("VICTORY_PREBUILD_VERBOSE") {
+            make()
+        } else {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), make)
+        };
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
         if made.is_some() {

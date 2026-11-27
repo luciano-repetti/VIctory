@@ -27,16 +27,71 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// The most view-heap slots a translated shader indexes: [`heap_views`]
+/// where the host takes a heap this large.
+pub const HEAP_VIEWS_MAX: u32 = 1 << 21;
+/// Sampler heap indices are clamped below this (`emit`, "Heap indices").
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+static HEAP_VIEWS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(HEAP_VIEWS_MAX);
+static HEAP_VIEWS_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// View heap indices are clamped below this: the host's view heap is at
+/// least this large, the slots past its own null (`emit`, "Heap indices").
+/// [`HEAP_VIEWS_MAX`] unless the host caps its heaps lower
+/// ([`set_heap_views`]). Part of every translation, so the shader cache
+/// keys on it.
+pub fn heap_views() -> u32 {
+    HEAP_VIEWS_READ.store(true, std::sync::atomic::Ordering::Relaxed);
+    HEAP_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`heap_views`] to the host's largest view heap (at most
+/// [`HEAP_VIEWS_MAX`], at least 2^17), before any shader is translated.
+/// False (and nothing changed) if a translation may already have used
+/// another value.
+pub fn set_heap_views(n: u32) -> bool {
+    let n = n.clamp(1 << 17, HEAP_VIEWS_MAX);
+    if HEAP_VIEWS_READ.load(std::sync::atomic::Ordering::Relaxed)
+        && HEAP_VIEWS.load(std::sync::atomic::Ordering::Relaxed) != n
+    {
+        return false;
+    }
+    HEAP_VIEWS.store(n, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+thread_local! {
+    /// Shaders finished on this thread declare no wave size above 32
+    /// ([`UndeclaredWave64`]).
+    static UNDECLARED_WAVE64: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While this lives, shaders finished on this thread declare no wave size
+/// above 32: a wave64 program lowered for 64-lane waves then runs in a
+/// host's narrower ones (`lower::lower_with`).
+pub(crate) struct UndeclaredWave64(bool);
+
+impl UndeclaredWave64 {
+    pub(crate) fn new() -> Self {
+        UndeclaredWave64(UNDECLARED_WAVE64.replace(true))
+    }
+}
+
+impl Drop for UndeclaredWave64 {
+    fn drop(&mut self) {
+        UNDECLARED_WAVE64.set(self.0);
+    }
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -50,7 +105,7 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// The first bit of the read marks of texture views (`emit`, "Read
 /// marks"), after the written pages in the same bitmap: one bit per
-/// resource-heap index, [`HEAP_VIEWS`] of them.
+/// resource-heap index, [`HEAP_VIEWS_MAX`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
@@ -542,7 +597,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -566,6 +621,12 @@ impl Shader {
             self.texture_index.insert(h, index);
         }
         h
+    }
+
+    /// The wave size the container declares: [`Shader::wave_size`], but
+    /// none above 32 while an [`UndeclaredWave64`] lives on this thread.
+    fn declared_wave_size(&self) -> Option<u32> {
+        self.wave_size.filter(|&n| n <= 32 || !UNDECLARED_WAVE64.get())
     }
 
     /// The finished container.
@@ -882,7 +943,7 @@ impl Shader {
             let state = [3, max, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
             props.push(self.m.md_node(state.to_vec()));
         }
-        if let Some(n) = self.wave_size {
+        if let Some(n) = self.declared_wave_size() {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
             props.push(self.m.md_node(vec![n]));
@@ -975,7 +1036,7 @@ impl Shader {
             gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
-            wave_size: self.wave_size,
+            wave_size: self.declared_wave_size(),
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

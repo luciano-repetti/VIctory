@@ -242,6 +242,107 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Formats the console renders to or stores to that a host may not, each
+/// with the formats of the same element size that stand in for it there:
+/// RGB9E5 by R11G11B10 float (HDR colour, 4 bytes), B4G4R4A4 by B5G5R5A1
+/// or B5G6R5 (2 bytes).
+/// shortcut: a stand-in reads the title's bits of the memory (copies of
+/// it) in its own layout, and keeps less precision or alpha.
+#[cfg(windows)]
+const STAND_INS: [(u32, &[u32]); 2] = [(67, &[26]), (115, &[86, 85])];
+
+/// Render target use in a texture's flags.
+#[cfg(windows)]
+const RENDER_TARGET: u32 = 1;
+
+/// Whether the host renders to (and blends into) `format` where
+/// `render_target`, and stores to it through typed unordered views where
+/// `unordered`.
+#[cfg(windows)]
+pub(crate) fn host_supports(format: u32, render_target: bool, unordered: bool) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static KNOWN: std::sync::Mutex<Vec<(u32, (u32, u32))>> = std::sync::Mutex::new(Vec::new());
+    let support = {
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        match known.iter().find(|(f, _)| *f == format) {
+            Some(&(_, s)) => s,
+            None => {
+                let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                    Format: DXGI_FORMAT(format as i32),
+                    ..Default::default()
+                };
+                let ok = crate::host::host().is_some_and(|h| {
+                    // SAFETY: a plain query into a struct of its size.
+                    unsafe {
+                        h.device.CheckFeatureSupport(
+                            D3D12_FEATURE_FORMAT_SUPPORT,
+                            (&raw mut data).cast(),
+                            size_of_val(&data) as u32,
+                        )
+                    }
+                    .is_ok()
+                });
+                let s = if ok { (data.Support1.0 as u32, data.Support2.0 as u32) } else { (0, 0) };
+                known.push((format, s));
+                s
+            }
+        }
+    };
+    let (one, two) = support;
+    let rt = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 | D3D12_FORMAT_SUPPORT1_BLENDABLE.0 as u32;
+    let uav = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32;
+    let store = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32;
+    (!render_target || one & rt == rt) && (!unordered || (one & uav != 0 && two & store != 0))
+}
+
+/// The format a host texture of `format` takes for `flags` (render
+/// target, unordered access): `format` where the host can use it so, else
+/// the first stand-in ([`STAND_INS`]) it can; `format` if none can.
+#[cfg(windows)]
+pub(crate) fn target_format(format: u32, flags: u32) -> u32 {
+    let (rt, uav) = (flags & RENDER_TARGET != 0, flags & UNORDERED != 0);
+    if !(rt || uav) || host_supports(format, rt, uav) {
+        return format;
+    }
+    let Some(&(_, ins)) = STAND_INS.iter().find(|(f, _)| *f == format) else {
+        return format;
+    };
+    // A render target's stand-in is chosen by rendering alone, so pipelines
+    // drawing to it (which know only that) pick the same one.
+    let pick = ins.iter().copied().find(|&f| {
+        if rt {
+            host_supports(f, true, false)
+        } else {
+            host_supports(f, false, true)
+        }
+    });
+    match pick {
+        Some(f) => {
+            static LOGGED: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+            let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+            if !logged.contains(&(format, f)) {
+                logged.push((format, f));
+                tracing::info!(format, stand_in = f, "the host cannot render or store in a format: a stand-in of its size");
+            }
+            f
+        }
+        None => format,
+    }
+}
+
+/// The format a view in `view` (host format) of a host texture in `host`
+/// names: the texture's where it stands in for the view's
+/// ([`target_format`]), else `view`.
+#[cfg(windows)]
+pub(crate) fn view_on(view: u32, host: u32) -> u32 {
+    if view != host && STAND_INS.iter().any(|(f, ins)| *f == view && ins.contains(&host)) {
+        host
+    } else {
+        view
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -289,7 +390,8 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    // A stand-in for the title's format is viewed in its own (`view_on`).
+    (format != own && view_on(own, format) != format).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -1131,6 +1233,26 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // Formats the host cannot render to or store to (RGB9E5, B4G4R4A4):
+    // a stand-in of the same size that it can. The 16-bit packed formats
+    // (B5G6R5, B5G5R5A1, B4G4R4A4) the host cannot store to get no
+    // unordered access: the host refuses to make such a texture with it,
+    // and unordered views of it stay null (`descriptor::host::fits`).
+    const PACKED_16: [u32; 3] = [85, 86, 115];
+    let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+    if !typeless && d.flags & DEPTH == 0 {
+        d.format = target_format(d.format, d.flags);
+        if d.flags & UNORDERED != 0
+            && PACKED_16.contains(&d.format)
+            && !host_supports(d.format, false, true)
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(format = d.format, "the host cannot store to a format: its textures get no unordered access");
+            });
+            d.flags &= !UNORDERED;
+        }
+    }
     Some(d)
 }
 
@@ -1305,7 +1427,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = view_on(pc_format(value[0]), d.format);
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -2508,6 +2630,27 @@ mod tests {
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
+    }
+
+    /// Stand-ins keep the element size (copies of the title's memory fit),
+    /// and views move onto a stand-in only from the format it stands in
+    /// for.
+    #[cfg(windows)]
+    #[test]
+    fn stand_ins_keep_the_element_and_views_follow_them() {
+        for (format, ins) in STAND_INS {
+            for &f in ins {
+                assert_eq!(element(f), element(format), "{format} -> {f}");
+                assert_eq!(view_on(format, f), f);
+                // Another format's view stays its own.
+                assert_eq!(view_on(28, f), 28);
+            }
+            // A texture in the format itself keeps views in it.
+            assert_eq!(view_on(format, format), format);
+        }
+        // Formats no texture needs a stand-in for are left as they are.
+        assert_eq!(target_format(28, 0), 28);
+        assert_eq!(target_format(67, 0), 67);
     }
 
     /// Castable formats: every format of the same element but typeless and

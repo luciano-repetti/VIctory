@@ -53,10 +53,132 @@ pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 
+/// A whole file mapped into memory. Its pages are the file's: under memory
+/// pressure the host drops them and reads them again, where a copy in
+/// process memory (the world's library is over 2 GB) would go to the page
+/// file and back.
+struct Mapped {
+    view: *mut u8,
+    len: usize,
+}
+
+// SAFETY: plain memory, read by all or written by its one owner.
+unsafe impl Send for Mapped {}
+
+impl Mapped {
+    /// `len` bytes of `file` mapped, writable where `writable`; none for an
+    /// empty file (Windows maps none).
+    fn new(file: &std::fs::File, len: usize, writable: bool) -> std::io::Result<Option<Mapped>> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY,
+            PAGE_READWRITE,
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+        let (protect, access) = if writable {
+            (PAGE_READWRITE, FILE_MAP_WRITE)
+        } else {
+            (PAGE_READONLY, FILE_MAP_READ)
+        };
+        let size = len as u64;
+        // SAFETY: a live file handle; the mapping handle is closed once the
+        // view holds the section.
+        unsafe {
+            let mapping = CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                protect,
+                (size >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            );
+            if mapping.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let view = MapViewOfFile(mapping, access, 0, 0, len);
+            let error = std::io::Error::last_os_error();
+            CloseHandle(mapping);
+            if view.Value.is_null() {
+                return Err(error);
+            }
+            Ok(Some(Mapped {
+                view: view.Value.cast(),
+                len,
+            }))
+        }
+    }
+
+    /// The file at `path`, mapped read-only; none if it is empty.
+    fn open(path: &std::path::Path) -> std::io::Result<Option<Mapped>> {
+        let file = std::fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| std::io::Error::other("file too large to map"))?;
+        Mapped::new(&file, len, false)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the view holds `len` bytes while this lives.
+        unsafe { std::slice::from_raw_parts(self.view, self.len) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above; a writable view this owns.
+        unsafe { std::slice::from_raw_parts_mut(self.view, self.len) }
+    }
+
+    /// Writes the view's changed pages to the file.
+    fn flush(&self) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Memory::FlushViewOfFile;
+        // SAFETY: a live view.
+        if unsafe { FlushViewOfFile(self.view.cast(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: the view this made, unmapped once.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.view.cast(),
+            });
+        }
+    }
+}
+
+/// The bytes a library is made from: they must outlive it.
+enum Blob {
+    /// In process memory: an empty library, or one made in a test.
+    Owned(Vec<u8>),
+    /// A library file, mapped ([`Mapped`]).
+    Mapped(Mapped),
+}
+
+impl Blob {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Blob::Owned(bytes) => bytes,
+            Blob::Mapped(m) => m.bytes(),
+        }
+    }
+}
+
+impl From<Vec<u8>> for Blob {
+    fn from(bytes: Vec<u8>) -> Self {
+        Blob::Owned(bytes)
+    }
+}
+
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    _blob: Blob,
     /// Pipelines stored since the last save.
     added: u64,
     /// Title pipelines the pre-build put in the library or found there, by
@@ -127,8 +249,75 @@ impl Drop for Held<'_> {
 /// Pipelines being loaded, or made and stored.
 static NAMES: Names = Names::new();
 
+/// The library file of generation 0 (as earlier versions wrote it); later
+/// generations are `host-pipelines-<n>.bin`. A save writes the next
+/// generation under its own name, since the loaded one stays mapped while
+/// its library lives and Windows refuses to replace a mapped file; older
+/// generations go once nothing maps them ([`remove_older`]).
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
+
+/// The generation of the library file mapped now (the loaded one), and the
+/// newest one written.
+static MAPPED_GENERATION: AtomicU64 = AtomicU64::new(0);
+static NEWEST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The file of library generation `n` in `dir`.
+fn generation_path(dir: &std::path::Path, n: u64) -> PathBuf {
+    if n == 0 {
+        dir.join(LIBRARY_FILE)
+    } else {
+        dir.join(format!("host-pipelines-{n}.bin"))
+    }
+}
+
+/// The generation a library file name holds, if it is one.
+fn generation_of(name: &str) -> Option<u64> {
+    if name == LIBRARY_FILE {
+        return Some(0);
+    }
+    name.strip_prefix("host-pipelines-")?
+        .strip_suffix(".bin")?
+        .parse()
+        .ok()
+}
+
+/// The library files in `dir`, by generation.
+fn generations(dir: &std::path::Path) -> Vec<(u64, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| Some((generation_of(e.file_name().to_str()?)?, e.path())))
+        .collect()
+}
+
+/// Removes the library files in `dir` older than generation `keep`, but
+/// the one mapped now, and temporary files saves left more than 10 minutes
+/// ago (a save killed midway: the world's are over 2 GB each).
+fn remove_older(dir: &std::path::Path, keep: u64) {
+    let mapped = MAPPED_GENERATION.load(Ordering::Relaxed);
+    for (n, path) in generations(dir) {
+        if n < keep && n != mapped {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(600));
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if stale && name.starts_with("host-pipelines") && name.contains(".tmp-") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
@@ -139,12 +328,33 @@ fn library() -> Option<&'static Shared> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
+            // The newest generation, mapped; the others removed.
+            let newest = DIR
+                .get()
+                .and_then(|d| generations(d).into_iter().max_by_key(|&(n, _)| n));
+            let blob = match newest {
+                Some((n, path)) => {
+                    MAPPED_GENERATION.store(n, Ordering::Relaxed);
+                    NEWEST_GENERATION.store(n, Ordering::Relaxed);
+                    if let Some(dir) = DIR.get() {
+                        remove_older(dir, n);
+                    }
+                    match Mapped::open(&path) {
+                        Ok(Some(m)) => Blob::Mapped(m),
+                        Ok(None) => Blob::Owned(Vec::new()),
+                        Err(e) => {
+                            tracing::warn!(error = %e, path = %path.display(), "host pipeline library not read");
+                            Blob::Owned(Vec::new())
+                        }
+                    }
+                }
+                None => Blob::Owned(Vec::new()),
+            };
+            let tag = tag(blob.bytes());
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
             if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
-                && !l._blob.is_empty()
+                && !l._blob.bytes().is_empty()
             {
                 l.prebuilt = listed(&list, &tag);
             }
@@ -158,19 +368,21 @@ fn library() -> Option<&'static Shared> {
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+fn open(device: &ID3D12Device1, blob: impl Into<Blob>) -> Option<Library> {
+    let blob = blob.into();
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
-    if !blob.is_empty() {
+    if !blob.bytes().is_empty() {
         let started = std::time::Instant::now();
-        match make(&blob) {
+        match make(blob.bytes()) {
             Ok(library) => {
                 let ms = started.elapsed().as_millis() as u64;
-                tracing::info!(bytes = blob.len(), ms, "host pipeline library loaded");
+                let mapped = matches!(blob, Blob::Mapped(_));
+                tracing::info!(bytes = blob.bytes().len(), ms, mapped, "host pipeline library loaded");
                 return Some(Library {
                     library,
                     _blob: blob,
@@ -187,7 +399,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let library = make(&[]).ok()?;
     Some(Library {
         library,
-        _blob: Vec::new(),
+        _blob: Blob::Owned(Vec::new()),
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
@@ -305,7 +517,10 @@ thread_local! {
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    // Each save writes the whole library (the world's is over 2 GB) and
+    // holds its lock meanwhile: every 20 s it wrote some 270 GB over a
+    // pre-build and stalled pipeline loads in play.
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -314,38 +529,78 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
+    // The next generation's file, written under a temporary name and named
+    // only once whole: a reader never sees a part.
+    let generation = NEWEST_GENERATION.load(Ordering::Relaxed) + 1;
+    let path = generation_path(dir, generation);
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let (bytes, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !l.prebuilt_changed {
+            // Only the early list changed (a run that made no pipeline):
+            // that list alone, not the whole library again.
+            if used_changed {
+                drop(l);
+                let used = used().as_ref().map(Used::list).unwrap_or_default();
+                if let Err(e) = std::fs::create_dir_all(dir)
+                    .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+                {
+                    tracing::warn!(error = %e, "early pipeline list not saved");
+                }
+            }
             return;
         }
-        // SAFETY: a plain size query on a live library.
+        // Serialised straight into the mapped file: no copy of the whole
+        // library in process memory (a 2 GB allocation that failed when
+        // memory ran short).
+        // SAFETY: a plain query on a live library.
         let size = unsafe { l.library.GetSerializedSize() };
-        let Some(mut bytes) = zeroed(size) else {
-            // Left for a later save: the pipelines stay counted as added.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-            return;
-        };
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
+        let serialised = std::fs::create_dir_all(dir)
+            .and_then(|()| {
+                std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp)
+            })
+            .and_then(|file| {
+                file.set_len(size as u64)?;
+                let mut view = Mapped::new(&file, size, true)?
+                    .ok_or_else(|| std::io::Error::other("an empty library"))?;
+                // SAFETY: a view of the size the library asks for, under
+                // the lock, so nothing is stored meanwhile.
+                unsafe { l.library.Serialize(view.bytes_mut()) }.map_err(std::io::Error::other)?;
+                view.flush()?;
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                Ok((!l.prebuilt.is_empty()).then(|| list(&tag(view.bytes()), &l.prebuilt)))
+            });
+        match serialised {
+            Ok(prebuilt) => {
+                l.added = 0;
+                l.prebuilt_changed = false;
+                (size, prebuilt)
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 return;
             }
         }
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+    let written = std::fs::rename(&tmp, &path)
+        .inspect(|()| {
+            NEWEST_GENERATION.store(generation, Ordering::Relaxed);
+            remove_older(dir, generation);
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
@@ -355,7 +610,8 @@ pub(crate) fn save(now: bool) {
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes,
+            generation,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -368,17 +624,6 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
-}
-
-/// `n` zero bytes, or `None` when the host has no memory for them. The
-/// library is about 1.7 GB on NVIDIA (each pipeline's machine code), and an
-/// infallible allocation of that size aborted the whole process mid-run
-/// ("memory allocation of 2650101862 bytes failed", RTX 4050 Laptop).
-fn zeroed(n: usize) -> Option<Vec<u8>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(n).ok()?;
-    v.resize(n, 0);
-    Some(v)
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -485,13 +730,6 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A size the host cannot give is refused, not fatal; others are zeros.
-    #[test]
-    fn a_save_buffer_the_host_cannot_give_is_refused() {
-        assert!(zeroed(usize::MAX / 2).is_none());
-        assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
-    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
@@ -814,7 +1052,99 @@ mod tests {
         let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
-        assert!(library._blob.is_empty());
+        assert!(library._blob.bytes().is_empty());
+    }
+
+    /// Library files by generation: the old name is generation 0, the
+    /// numbered ones theirs; temporary files of a save are none.
+    #[test]
+    fn library_files_are_named_by_generation() {
+        assert_eq!(generation_of("host-pipelines.bin"), Some(0));
+        assert_eq!(generation_of("host-pipelines-12.bin"), Some(12));
+        assert_eq!(generation_of("host-pipelines-12.bin.tmp-55"), None);
+        assert_eq!(generation_of("host-pipelines.bin.tmp-16648-38"), None);
+        assert_eq!(generation_of("host-pipelines.bin.before-wave-fix"), None);
+        assert_eq!(generation_of("early-pipelines.txt"), None);
+        let dir = std::path::Path::new("x");
+        assert_eq!(generation_path(dir, 0), dir.join("host-pipelines.bin"));
+        assert_eq!(generation_path(dir, 3), dir.join("host-pipelines-3.bin"));
+    }
+
+    /// Older generations go but the mapped one; old temporary files go,
+    /// recent ones (a save in progress) stay; other files stay.
+    #[test]
+    fn older_generations_and_stale_temporaries_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for n in 0..4 {
+            std::fs::write(generation_path(d, n), b"x").unwrap();
+        }
+        let old_tmp = d.join("host-pipelines.bin.tmp-16648-38");
+        let new_tmp = d.join("host-pipelines-5.bin.tmp-77");
+        let other = d.join("host-pipelines.bin.before-wave-fix");
+        for p in [&old_tmp, &new_tmp, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&old_tmp).unwrap().set_modified(hour_ago).unwrap();
+        MAPPED_GENERATION.store(1, Ordering::Relaxed);
+        remove_older(d, 3);
+        let left: Vec<u64> = {
+            let mut g: Vec<u64> = generations(d).into_iter().map(|(n, _)| n).collect();
+            g.sort_unstable();
+            g
+        };
+        assert_eq!(left, [1, 3], "the mapped and the newest stay");
+        assert!(!old_tmp.exists());
+        assert!(new_tmp.exists());
+        assert!(other.exists());
+    }
+
+    /// What is written through a writable mapping is what a read-only
+    /// mapping of the file reads; an empty file maps to none.
+    #[test]
+    fn mapped_files_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        {
+            let file = std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+            file.set_len(bytes.len() as u64).unwrap();
+            let mut view = Mapped::new(&file, bytes.len(), true).unwrap().unwrap();
+            view.bytes_mut().copy_from_slice(&bytes);
+            view.flush().unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let read = Mapped::open(&path).unwrap().unwrap();
+        assert_eq!(read.bytes(), &bytes[..]);
+        drop(read);
+        std::fs::write(&path, b"").unwrap();
+        assert!(Mapped::open(&path).unwrap().is_none());
+    }
+
+    /// A library serialised into a mapped file is taken by the host from a
+    /// read-only mapping of that file.
+    #[test]
+    fn a_library_loads_from_a_mapped_file() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let empty = open(&device, Vec::new()).expect("an empty library");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host-pipelines-1.bin");
+        {
+            // SAFETY: a plain query on a live library.
+            let size = unsafe { empty.library.GetSerializedSize() };
+            let file = std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+            file.set_len(size as u64).unwrap();
+            let mut view = Mapped::new(&file, size, true).unwrap().unwrap();
+            // SAFETY: a view of the size asked for.
+            unsafe { empty.library.Serialize(view.bytes_mut()) }.unwrap();
+            view.flush().unwrap();
+        }
+        let mapped = Mapped::open(&path).unwrap().expect("a non-empty file");
+        let library = open(&device, Blob::Mapped(mapped)).expect("a library");
+        assert!(matches!(library._blob, Blob::Mapped(_)), "taken, not rejected for an empty one");
     }
 
     #[test]

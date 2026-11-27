@@ -2,7 +2,10 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it; on a host without
+//! 64-lane waves ([`set_host_wave64`]) a wave64 program runs each console
+//! wave as two host waves of 32 lanes instead, exchanging values between
+//! them through group-shared memory where it can (`lower::wave64`).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -83,7 +86,7 @@
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner opposite the right angle ([`right_angle`]), as the console's
 //!   hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
+//! * **Heap indices** (added 2026-11-24) are clamped to [`heap_views`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
 //!   still wrong; the console would read whatever memory follows its heap)
@@ -92,8 +95,8 @@
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
 //!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   [`heap_views`], dynamic slots too); where it holds 0 (no buffer view
+//!   there) the shader reads heap index [`null_buffer_view`] instead (for
 //!   unordered access the index below), which the host keeps a null raw
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
@@ -213,6 +216,8 @@ mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
+mod lane_order_tests;
+#[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
 #[cfg(all(test, windows))]
@@ -229,6 +234,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -236,13 +243,58 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_SAMPLERS, HEAP_VIEWS_MAX, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+    VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES,
+    VIEW_WRITE_BITS, VIEW_WRITES, heap_views, null_buffer_view, set_heap_views,
 };
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^12.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+
+static HOST_WAVE64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Tells the translation whether the host runs compute shaders in 64-lane
+/// waves (D3D12 `WaveLaneCountMax` of 64 or more; AMD's do, NVIDIA's run
+/// 32). Without, a wave64 compute program that needs the console's lanes
+/// is split into host waves of 32 lanes, or refused where that cannot be
+/// exact. Set it before translating; the value is part of the translation,
+/// so a cache of translations must key on it. Default: 64-lane waves.
+pub fn set_host_wave64(supported: bool) {
+    HOST_WAVE64.store(supported, std::sync::atomic::Ordering::Relaxed);
+}
+
+static WAVE64_APPROX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// On a host without 64-lane waves ([`set_host_wave64`]): wave64 programs
+/// the exact split refuses run anyway, in the host's waves, their
+/// cross-lane results possibly wrong (`lower::lower_with`), instead of
+/// being left out. Off by default; part of every translation, so the
+/// shader cache keys on it.
+pub fn set_wave64_approx(on: bool) {
+    WAVE64_APPROX.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Iterations after which a loop of an approximately lowered wave64
+/// program is left: `VICTORY_WAVE64_LOOPS` (1 to 4096), 64 without it.
+pub fn wave64_approx_loops() -> u32 {
+    static LOOPS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LOOPS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE64_LOOPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(64, |n| n.clamp(1, 4096))
+    })
+}
+
+/// What [`set_wave64_approx`] last set.
+pub fn wave64_approx() -> bool {
+    WAVE64_APPROX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What [`set_host_wave64`] last set.
+pub fn host_wave64() -> bool {
+    HOST_WAVE64.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].

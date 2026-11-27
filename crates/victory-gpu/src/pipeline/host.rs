@@ -218,8 +218,13 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
+                    // Targets in formats the host cannot render to are made
+                    // in a stand-in (`resource::target_format`): so are the
+                    // pipelines drawing to them.
+                    const RENDER_TARGET: u32 = 1;
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                        let format = crate::resource::pc_format(f.0 as u32);
+                        f.0 = crate::resource::target_format(format, RENDER_TARGET) as i32;
                     }
                 }
                 16 => {
