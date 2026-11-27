@@ -5,8 +5,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -274,54 +272,73 @@ fn present_behind() -> bool {
     })
 }
 
+/// Queues a PresentX behind the work its queue holds; its frame number, or
+/// `None` where it must run now.
 #[cfg(windows)]
-fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
+fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> Option<u64> {
     if this.is_null() || planes == 0 || plane_parameters.is_null() || !may_send_behind(PRESENTS_HELD.load(Ordering::Relaxed), frames_ahead()) {
-        return false;
+        return None;
     }
-    let frame = FRAMES.load(Ordering::Relaxed) + 1;
     #[cfg(feature = "diagnostics")]
-    if crate::capture::wanted(frame) || crate::capture::listed(frame) {
-        return false;
+    if crate::capture::wanted(FRAMES.load(Ordering::Relaxed) + 1) || crate::capture::listed(FRAMES.load(Ordering::Relaxed) + 1) {
+        return None;
     }
     // SAFETY: the title passes `planes` plane descriptions.
     let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+    // The host textures, not the title's resources: the title may release
+    // them before the queue gets here, and what the host needs of them (the
+    // texture, its state) is theirs.
     let mut sources = Vec::new();
-    let mut states = Vec::new();
     for plane in slice {
         if plane.count == 0 || plane.resources.is_null() {
             continue;
         }
         // SAFETY: the plane lists `count` resources.
         let resource = unsafe { *plane.resources };
-        let Some(texture) = crate::resource::host_resource(resource) else { continue };
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-        crate::resource::host_transition(resource, state);
-        sources.push((resource as usize, texture, state));
-        states.push(state);
+        if let Some(copy) = crate::resource::host_copy(resource) {
+            sources.push(copy);
+        }
     }
     if sources.is_empty() {
-        return false;
+        return None;
     }
-    let _ = states;
+    // One number per present, taken when it is queued: the next PresentX
+    // before this one is shown is the frame after it.
+    let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     held().push(this as usize, Held::Present(sources, frame));
     PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
     wake();
-    true
+    Some(frame)
 }
 
+/// Shows a queued PresentX's planes. Their states are the ones the lists
+/// before it left (`HostList::prelude` moves them as a submission is
+/// prepared), so they are read here, as `present` reads them.
 #[cfg(windows)]
-fn show_present(sources: Vec<(usize, ID3D12Resource, u32)>, frame: u64) {
+fn show_present(planes: Vec<Arc<crate::resource::HostTexture>>, frame: u64) {
+    const COPY_SOURCE: u32 = 0x800;
     if let Some(host) = crate::host::host() {
-        let refs: Vec<(&ID3D12Resource, u32)> = sources.iter().map(|(_, texture, state)| (texture, *state)).collect();
+        // Distinct title resources may name one host texture: it is moved
+        // once, and every plane of it has the state it had before.
+        let mut moved: Vec<(&Arc<crate::resource::HostTexture>, u32)> = Vec::new();
+        let mut refs = Vec::with_capacity(planes.len());
+        for plane in &planes {
+            let state = match moved.iter().find(|(earlier, _)| Arc::ptr_eq(earlier, plane)) {
+                Some(&(_, state)) => state,
+                None => {
+                    let before = plane.state.swap(COPY_SOURCE, Ordering::Relaxed);
+                    moved.push((plane, before));
+                    before
+                }
+            };
+            refs.push((&plane.texture, state));
+        }
         let _ = host.present(&refs, frame);
-        for &(resource, _, state) in &sources {
-            crate::resource::host_transition(resource as This, state);
+        for (plane, before) in moved {
+            plane.state.store(before, Ordering::Relaxed);
         }
     }
     PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
-    FRAMES.store(frame, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::frame::presented();
 }
@@ -671,26 +688,23 @@ extern "system" fn present(
     _parameters: *const u8,
 ) -> HRESULT {
     #[cfg(windows)]
-    let sent = present_behind() && send_behind(this, planes, plane_parameters);
+    let sent = if present_behind() { send_behind(this, planes, plane_parameters) } else { None };
     #[cfg(not(windows))]
-    let sent = false;
-    if !sent {
+    let sent: Option<u64> = None;
+    let sent_behind = sent.is_some();
+    if !sent_behind {
         if crate::host::late() && !crate::host::late_free_present() {
             crate::host::settle_for_present();
         }
         pump_held(Why::Present);
     }
-    let frame = if sent {
-        FRAMES.load(Ordering::Relaxed) + 1
-    } else {
-        FRAMES.fetch_add(1, Ordering::Relaxed) + 1
-    };
+    let frame = sent.unwrap_or_else(|| FRAMES.fetch_add(1, Ordering::Relaxed) + 1);
     #[cfg(windows)]
-    if !sent {
+    if !sent_behind {
         account_frame(frame);
     }
     #[cfg(feature = "diagnostics")]
-    if !sent {
+    if !sent_behind {
         // A held present counts in `show_present`, where it actually runs.
         crate::frame::presented();
     }
@@ -730,7 +744,7 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    if !sent
+    if !sent_behind
         && planes > 0
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
@@ -1072,6 +1086,119 @@ mod tests {
             7
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// A title texture with a host copy, a queue, and a fence a PresentX can
+    /// be held behind. Only with `VICTORY_ASYNC_PRESENT=1` (and the switches
+    /// it needs); otherwise nothing is sent behind.
+    #[cfg(windows)]
+    struct HeldPresent {
+        address: usize,
+        resource: This,
+        queue: This,
+        fence: This,
+    }
+
+    #[cfg(windows)]
+    impl HeldPresent {
+        fn new() -> Option<Self> {
+            crate::host::host()?;
+            if !present_behind() {
+                return None;
+            }
+            let address = crate::watch::tests::pool(1);
+            let null = std::ptr::null();
+            let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+            #[repr(align(8))]
+            struct TextureWords([u32; 14]);
+            let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 87, 1, 0, 1, 1, 0]);
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_at_address(null, address as u64, desc.0.as_ptr().cast(), 0, null.cast(), &iid, &mut resource),
+                S_OK
+            );
+            let mut queue = null;
+            let queue_desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+            assert_eq!(create(null, &queue_desc, &QUEUE_IIDS[0], &mut queue), S_OK);
+            let mut fence = null;
+            assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+            // The queue's head is a wait nothing satisfies yet, so no worker
+            // shows a PresentX queued behind it before the test says so.
+            held().push(queue as usize, Held::FenceWait(fence as usize, 1));
+            Some(HeldPresent { address, resource, queue, fence })
+        }
+
+        fn present(&self) -> Option<u64> {
+            let plane = Plane { token: 0, count: 1, resources: &self.resource, _rest: [0; 6] };
+            send_behind(self.queue, 1, &plane)
+        }
+
+        /// Reaches the fence and waits until every queued PresentX was shown.
+        fn finish(self) {
+            crate::fence::set(self.fence, 1);
+            pump_held(Why::Timer);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while PRESENTS_HELD.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(PRESENTS_HELD.load(Ordering::Relaxed), 0, "the held presents were shown");
+            let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+            release(self.resource);
+            release(self.queue);
+            release(self.fence);
+            crate::watch::tests::free(self.address);
+        }
+    }
+
+    /// A PresentX sent behind the queue's work is shown in the state the
+    /// lists before it leave the texture in (a submission moves the host
+    /// texture's state as it is prepared, after PresentX was called), and
+    /// the state it leaves is the one the next list starts from.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_present_shows_the_state_the_earlier_lists_left() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET;
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let Some(held_present) = HeldPresent::new() else { return };
+        let host = crate::host::host().unwrap();
+        let copy = crate::resource::host_copy(held_present.resource).unwrap();
+        assert!(held_present.present().is_some(), "queued behind the wait");
+        // The frame's list runs after PresentX was called: the worker prepares
+        // it later. It leaves the texture a render target.
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, held_present.resource, TARGET);
+        // SAFETY: the texture is a live render target, on an open list.
+        unsafe {
+            list.list.ClearRenderTargetView(host.rtv(&copy.texture, None), &[0.25, 0.5, 0.75, 1.0], None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(copy.state.load(Ordering::Relaxed), TARGET);
+        held_present.finish();
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            TARGET,
+            "the held present put back the state the texture had when PresentX was called"
+        );
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Presents sent behind the queue take consecutive frame numbers when
+    /// they are queued, not the same one until the first is shown.
+    #[cfg(windows)]
+    #[test]
+    fn held_presents_take_consecutive_frame_numbers() {
+        if frames_ahead() < 2 {
+            return;
+        }
+        let Some(held_present) = HeldPresent::new() else { return };
+        let before = presented();
+        let first = held_present.present().expect("queued");
+        let second = held_present.present().expect("queued");
+        assert_eq!(second, first + 1, "{first} then {second}");
+        assert_eq!(presented(), before + 2, "both frames are counted once queued");
+        held_present.finish();
     }
 
     /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.

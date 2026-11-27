@@ -17,9 +17,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
-
 /// A wait for a memory value, as a list records it: the value at `address`
 /// (`bytes` 4 or 8, the 32-bit form masked) compared with `reference` by a
 /// D3D12 comparison function.
@@ -73,8 +70,11 @@ pub(crate) enum Item<S> {
     Signal(usize, u64),
     /// A fence Wait: until the fence reaches the value.
     FenceWait(usize, u64),
+    /// A PresentX: the host textures of its planes, which the host shows
+    /// once everything before it has run. Their states are read then, not
+    /// when PresentX was called: the lists before it move them.
     #[cfg(windows)]
-    Present(Vec<(usize, ID3D12Resource, u32)>, u64),
+    Present(Vec<std::sync::Arc<crate::resource::HostTexture>>, u64),
 }
 
 /// What a pump did, for the frame's accounting.
@@ -123,7 +123,7 @@ pub(crate) struct World<'a, S> {
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
     #[cfg(windows)]
-    pub(crate) present: &'a mut dyn FnMut(Vec<(usize, ID3D12Resource, u32)>, u64),
+    pub(crate) present: &'a mut dyn FnMut(Vec<std::sync::Arc<crate::resource::HostTexture>>, u64),
 }
 
 impl<S> Held<S> {
