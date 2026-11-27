@@ -176,6 +176,41 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
+/// The view heap size for [`super::heap_views`] in the translator's own
+/// tests, which have no `victory-gpu` host to say it: [`super::HEAP_VIEWS_MAX`]
+/// where the test host's adapter makes a shader-visible view heap that large,
+/// else 1,000,000 (the most every host takes; NVIDIA and Intel Arc refuse
+/// more). The adapter is the default one, or WARP with `VICTORY_WARP=1` (as
+/// [`Host::new`]). Without a device, [`super::HEAP_VIEWS_MAX`]: no test runs
+/// on a host then.
+#[cfg(test)]
+pub(crate) fn test_heap_views() -> u32 {
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    // SAFETY: plain DXGI/device and heap creation with valid out pointers.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        let made = if warp {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumWarpAdapter::<IDXGIAdapter1>())
+                .and_then(|adapter| D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device))
+        } else {
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+        };
+        let Some(device) = device.filter(|_| made.is_ok()) else {
+            return super::HEAP_VIEWS_MAX;
+        };
+        let takes = device
+            .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: super::HEAP_VIEWS_MAX,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .is_ok();
+        if takes { super::HEAP_VIEWS_MAX } else { 1_000_000 }
+    }
+}
+
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp

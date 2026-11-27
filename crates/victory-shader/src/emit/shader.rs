@@ -51,6 +51,15 @@ static HEAP_VIEWS_READ: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// ([`set_heap_views`]). Part of every translation, so the shader cache
 /// keys on it.
 pub fn heap_views() -> u32 {
+    // The translator's own tests have no host to set it: their test host's
+    // adapter does, once, before the first read.
+    #[cfg(all(windows, test))]
+    {
+        static TEST_HOST: std::sync::Once = std::sync::Once::new();
+        TEST_HOST.call_once(|| {
+            set_heap_views(super::host::test_heap_views());
+        });
+    }
     HEAP_VIEWS_READ.store(true, std::sync::atomic::Ordering::Relaxed);
     HEAP_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
 }
