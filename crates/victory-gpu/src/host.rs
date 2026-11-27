@@ -1433,7 +1433,31 @@ impl Host {
                 }
             }
         }
-        for item in line().take_up_to(target) {
+        // The line stays locked while the flights land (as the loop over a
+        // temporary guard kept it): a Signal that comes meanwhile waits and
+        // goes after them.
+        let mut landing = line();
+        let done = landing.take_up_to(target);
+        // Only the synchronous tail of `execute_inner` asks this: a flight sent
+        // ahead never did, so a lost device went unreported.
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            let runs: Vec<&HostList> = done
+                .iter()
+                .filter_map(|item| match item {
+                    Late::Run(flight) => Some(flight.lists.iter().map(|list| &**list)),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            fail(format_args!(
+                "host GPU device removed after a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(&runs),
+                last_notes(&runs)
+            ));
+        }
+        for item in done {
             match item {
                 Late::Run(Flight { back, missed: checks, after, lists, keep, .. }) => {
                     // The checks ask about what the shaders did, so they can
@@ -1501,6 +1525,7 @@ impl Host {
                 }
             }
         }
+        drop(landing);
         let _ = submitted;
         LINE_LANDED.notify_all();
     }
@@ -4572,6 +4597,28 @@ mod present_plane_tests {
 #[cfg(test)]
 mod flight_tests {
     use super::*;
+
+    /// A lost device ends the run when a flight sent ahead lands, as it does
+    /// after a synchronous submission (`fail`). It removes the host device
+    /// for the whole process, so it runs alone:
+    /// `cargo test -p victory-gpu --lib -- --ignored a_removed_device`
+    #[test]
+    #[ignore = "removes the host device for the whole process"]
+    #[should_panic(expected = "device removed")]
+    fn a_removed_device_is_reported_when_a_flight_lands() {
+        fn report(text: &str) -> ! {
+            panic!("{text}")
+        }
+        on_failure(report);
+        let host = host().expect("a host GPU");
+        let list = host.new_list().unwrap();
+        list.close();
+        // SAFETY: a plain call; nothing runs on the device afterwards.
+        unsafe { host.device.cast::<ID3D12Device5>().unwrap().RemoveDevice() };
+        host.execute_ahead(vec![Arc::new(list)]);
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.settle(&mut submitted);
+    }
 
     #[test]
     fn flights_settle_in_submission_order() {
