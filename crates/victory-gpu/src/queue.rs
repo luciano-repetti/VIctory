@@ -1074,6 +1074,47 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
+    /// What a title polls for "the GPU is done with this list": a word the
+    /// list writes at its end. With `VICTORY_LATE_WAIT` the write lands when
+    /// the line of flights settles, so something must settle it without the
+    /// title making another call: the title thread that polls is the one
+    /// that would make it. Runs only with a late stage on.
+    #[cfg(windows)]
+    #[test]
+    fn a_flag_a_list_writes_reaches_the_title_without_another_call() {
+        if !crate::host::late() || crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let address = crate::watch::tests::pool(1);
+        let flag = address as *mut u64;
+        // SAFETY: the pool is ours; nothing runs on it yet.
+        unsafe { flag.write_volatile(0) };
+        let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let desc = [0u32; 4];
+        assert_eq!(create(null, desc.as_ptr().cast(), &queue_iid, &mut queue), S_OK);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+        crate::list::write64(list, address as u64, 1, 0, 0);
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // SAFETY: a word of our pool.
+        let read = || unsafe { flag.read_volatile() };
+        while read() != 1 && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let landed_alone = read() == 1;
+        // Not a title's call: lets the line land so the test leaves none.
+        crate::host::settle_now();
+        assert_eq!(read(), 1, "even a settle on request does not land it");
+        crate::watch::tests::free(address);
+        assert!(landed_alone, "the flag stayed 0 for 3 s: nothing settles the line until the title presents");
+    }
+
     /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
     #[test]
     fn console_queues_are_created_as_on_pc() {

@@ -1365,6 +1365,45 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// Submissions that overlap (`VICTORY_LATE_WAIT`): the second is prepared
+    /// while the first one's shaders have run but are not copied back yet.
+    /// Its refresh of a range they wrote must not put the title's older
+    /// bytes over theirs when the title has written elsewhere in the same
+    /// pages (command memory shares the heap with what shaders write).
+    /// In the order the baseline has (copy-back first) nothing is lost.
+    #[test]
+    fn a_refresh_before_an_earlier_copy_back_keeps_the_gpus_bytes() {
+        for overlapped in [false, true] {
+            let p = crate::watch::tests::pool(1);
+            let len = PAGE;
+            register(p, p as u64, len as u64);
+            let Some(copy) = find(p as u64, len as u64) else {
+                unregister(p, p as u64);
+                return; // no host GPU here
+            };
+            let title = |at: usize| (p + at) as *mut u8;
+            copy.update(p, len);
+            // Submission 1 declares 0..64 as written by shaders; they run.
+            copy.writing(p, 64, false);
+            copy.write_host(p as u64, &[0xaa; 8]);
+            // The title writes a constant in the same pages.
+            // SAFETY: a byte of our pool.
+            unsafe { title(100).write_volatile(0x55) };
+            if overlapped {
+                // Submission 2 is prepared first: a draw reads 0..64.
+                copy.update(p, 64);
+                copy.copy_back(p, 64);
+            } else {
+                copy.copy_back(p, 64);
+                copy.update(p, 64);
+            }
+            // SAFETY: bytes of our pool.
+            let got = unsafe { std::slice::from_raw_parts(title(0), 8) }.to_vec();
+            unregister(p, p as u64);
+            assert_eq!(got, [0xaa; 8], "overlapped: {overlapped}");
+        }
+    }
+
     /// A title buffer over a pool and, after it, a plain allocation (memory
     /// that is not the runtime's): the pool is tracked and guarded; the
     /// plain allocation's bytes are copied at each use and never guarded,
