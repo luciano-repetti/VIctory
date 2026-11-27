@@ -1520,11 +1520,12 @@ impl Host {
             line.add(flight);
             drop(line);
             LINE_MOVED.notify_one();
-            if relay() {
-                RELAY_STARTED.get_or_init(|| {
-                    let _ = std::thread::Builder::new().name("victory-relay".into()).spawn(relay_worker);
-                });
-            }
+            // Whatever the stage, something has to land the line when the
+            // title makes no call that does: a flag a list writes is what it
+            // polls for the GPU being done.
+            RELAY_STARTED.get_or_init(|| {
+                let _ = std::thread::Builder::new().name("victory-relay".into()).spawn(relay_worker);
+            });
         }
     }
 
