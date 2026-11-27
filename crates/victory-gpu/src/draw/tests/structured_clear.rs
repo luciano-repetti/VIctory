@@ -51,6 +51,7 @@ fn structured_clears_preserve_neighbor_words_in_the_shared_buffer() {
                 init.close();
                 host.execute(&[&init]);
                 assert_eq!(shadow.read_host(address, 32), original);
+                let _ = host.log_messages();
 
                 let mut state = State::default();
                 state.set_heaps(&[heap.0]);
@@ -69,6 +70,11 @@ fn structured_clears_preserve_neighbor_words_in_the_shared_buffer() {
                 // SAFETY: this test is the sole recorder; submit only a valid list.
                 unsafe { list.list.Close() }.expect("a legal clear must close");
                 host.execute(&[&list]);
+                let debug = host.log_messages();
+                if let Some(error) = &debug {
+                    eprintln!("CLEAR bias={bias} float={float} partial={partial} D3D12: {error}");
+                    failed += 1;
+                }
                 let mut expected = original;
                 let start = first as usize * 3;
                 let cleared = if partial {
